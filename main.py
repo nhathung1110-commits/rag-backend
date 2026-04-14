@@ -20,6 +20,12 @@ if not API_KEY:
 # =========================
 app = FastAPI(title="Simple RAG API")
 
+# 🔥 WARMUP KHI START (FIX 502)
+@app.on_event("startup")
+def startup_event():
+    print("🔥 Warming up model...")
+    init_system()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
