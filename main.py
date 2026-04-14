@@ -1,18 +1,15 @@
 import os
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from fastapi.middleware.cors import CORSMiddleware
 
 # =========================
-# LOAD ENV
+# ENV
 # =========================
-load_dotenv()
-
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not API_KEY:
@@ -38,30 +35,45 @@ class ChatRequest(BaseModel):
     question: str
 
 # =========================
-# EMBEDDING
+# GLOBAL (lazy load)
 # =========================
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+embedding_model = None
+vectorstore = None
+llm = None
 
 # =========================
-# LOAD FAISS
+# INIT SYSTEM (SAFE)
 # =========================
-vectorstore = FAISS.load_local(
-    "faiss_index",
-    embedding_model,
-    allow_dangerous_deserialization=True
-)
+def init_system():
+    global embedding_model, vectorstore, llm
 
-# =========================
-# LLM
-# =========================
-llm = ChatOpenAI(
-    model="openai/gpt-4o-mini",
-    base_url="https://openrouter.ai/api/v1",
-    api_key=API_KEY,
-    temperature=0
-)
+    try:
+        if embedding_model is None:
+            embedding_model = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2"
+            )
+
+        if vectorstore is None:
+            if os.path.exists("faiss_index"):
+                vectorstore = FAISS.load_local(
+                    "faiss_index",
+                    embedding_model,
+                    allow_dangerous_deserialization=True
+                )
+                print("✅ FAISS loaded")
+            else:
+                print("⚠️ faiss_index not found → running without RAG")
+
+        if llm is None:
+            llm = ChatOpenAI(
+                model="openai/gpt-4o-mini",
+                base_url="https://openrouter.ai/api/v1",
+                api_key=API_KEY,
+                temperature=0
+            )
+
+    except Exception as e:
+        print("❌ INIT ERROR:", e)
 
 # =========================
 # HEALTH CHECK
@@ -76,30 +88,29 @@ def health():
 @app.post("/chat")
 def chat(req: ChatRequest):
     try:
+        init_system()
+
         question = req.question
-
-        # =========================
-        # VECTOR SEARCH
-        # =========================
-        results = vectorstore.similarity_search_with_score(question, k=3)
-
         docs = []
-        threshold = 2.0  # FIX threshold
 
-        for doc, score in results:
-            print("Score:", score)
-            if score < threshold:
-                docs.append(doc)
+        # =========================
+        # VECTOR SEARCH (SAFE)
+        # =========================
+        if vectorstore:
+            results = vectorstore.similarity_search_with_score(question, k=3)
 
-        # fallback nếu vẫn rỗng
-        if not docs:
-            print("No relevant docs → using all results")
-            docs = [doc for doc, _ in results]
+            threshold = 2.0
+            for doc, score in results:
+                if score < threshold:
+                    docs.append(doc)
+
+            if not docs:
+                docs = [doc for doc, _ in results]
 
         # =========================
         # BUILD PROMPT
         # =========================
-        context = "\n\n".join([doc.page_content for doc in docs])
+        context = "\n\n".join([doc.page_content for doc in docs]) if docs else ""
 
         prompt = f"""
 You are a helpful assistant.
@@ -119,18 +130,12 @@ Question:
         # =========================
         response = llm.invoke(prompt)
 
-        # =========================
-        # FIX CRASH (.content)
-        # =========================
-        if hasattr(response, "content"):
-            answer = response.content
-        else:
-            answer = str(response)
+        answer = response.content if hasattr(response, "content") else str(response)
 
         return {"answer": answer}
 
     except Exception as e:
-        print("ERROR:", e)
+        print("❌ ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
